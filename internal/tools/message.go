@@ -51,7 +51,7 @@ func (t *MessageTool) Parameters() map[string]any {
 			},
 			"message": map[string]any{
 				"type":        "string",
-				"description": "Message content to send. To send a file as attachment, use the prefix MEDIA: followed by the file path, e.g. 'MEDIA:docs/report.pdf' or 'MEDIA:/tmp/image.png'. The file will be uploaded as a document/photo/audio depending on its type.",
+				"description": "Message content to send. To send a file as attachment, use the prefix MEDIA: followed by the file path, e.g. 'MEDIA:docs/report.pdf'. Restricted agents can only attach files within their workspace. The file will be uploaded as a document/photo/audio depending on its type.",
 			},
 		},
 		"required": []string{"action", "message"},
@@ -166,7 +166,7 @@ func isGroupContext(ctx context.Context) bool {
 
 // resolveMediaPath extracts and validates a file path from a "MEDIA:path" string.
 // Uses the same workspace-aware path resolution as other filesystem tools:
-//   - When restrict_to_workspace is true: allows workspace dir + /tmp/
+//   - When restrict_to_workspace is true: allows only workspace files
 //   - When restrict_to_workspace is false: allows any valid path
 //
 // Relative paths are resolved against the agent's workspace.
@@ -189,22 +189,8 @@ func (t *MessageTool) resolveMediaPath(ctx context.Context, s string) (string, b
 	// resolvePath handles relative→absolute, symlink, hardlink, boundary checks.
 	resolved, err := resolvePath(raw, workspace, restrict)
 	if err != nil {
-		// When restricted, also allow /tmp/ (used by create_image, create_audio, etc.)
-		if restrict && isInTempDir(raw) {
-			return filepath.Clean(raw), true
-		}
 		return "", false
 	}
 
 	return resolved, true
-}
-
-// isInTempDir checks whether an absolute path is inside os.TempDir().
-func isInTempDir(path string) bool {
-	cleaned := filepath.Clean(path)
-	if !filepath.IsAbs(cleaned) {
-		return false
-	}
-	tmpDir := filepath.Clean(os.TempDir())
-	return strings.HasPrefix(cleaned, tmpDir+string(filepath.Separator))
 }

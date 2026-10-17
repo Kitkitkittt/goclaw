@@ -2,9 +2,16 @@ package tools
 
 import (
 	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/tts"
 )
 
 func TestResolveMediaPath(t *testing.T) {
@@ -31,9 +38,9 @@ func TestResolveMediaPath(t *testing.T) {
 			want   string
 			wantOK bool
 		}{
-			// /tmp/ always allowed
-			{"valid temp file", "MEDIA:" + filepath.Join(tmpDir, "test.png"), filepath.Join(tmpDir, "test.png"), true},
-			{"valid nested temp", "MEDIA:" + filepath.Join(tmpDir, "sub", "file.txt"), filepath.Join(tmpDir, "sub", "file.txt"), true},
+			// Temp paths outside the workspace are not a separate trust boundary.
+			{"outside temp file", "MEDIA:" + filepath.Join(tmpDir, "test.png"), "", false},
+			{"outside nested temp", "MEDIA:" + filepath.Join(tmpDir, "sub", "file.txt"), "", false},
 
 			// Workspace files allowed
 			{"workspace absolute", "MEDIA:" + testFile, testFile, true},
@@ -46,7 +53,7 @@ func TestResolveMediaPath(t *testing.T) {
 			{"empty string", "", "", false},
 			{"just MEDIA", "MEDIA", "", false},
 
-			// Outside workspace + outside /tmp/ → blocked
+			// Outside workspace paths are blocked, including siblings under /tmp/.
 			{"outside workspace", "MEDIA:/etc/passwd", "", false},
 			{"traversal attack", "MEDIA:" + filepath.Join(workspace, "..", "etc", "passwd"), "", false},
 		}
@@ -103,24 +110,113 @@ func TestResolveMediaPath(t *testing.T) {
 	})
 }
 
-func TestIsInTempDir(t *testing.T) {
-	tmpDir := os.TempDir()
-	tests := []struct {
-		name string
-		path string
-		want bool
-	}{
-		{"in tmp", filepath.Join(tmpDir, "test.png"), true},
-		{"nested in tmp", filepath.Join(tmpDir, "sub", "file.txt"), true},
-		{"tmp itself", tmpDir, false}, // only files inside, not the dir itself
-		{"outside tmp", "/etc/passwd", false},
-		{"relative path", "relative/path.txt", false},
-		{"traversal", filepath.Join(tmpDir, "..", "etc", "passwd"), false},
+func TestMessageMediaWorkspaceBoundary(t *testing.T) {
+	root := t.TempDir()
+	workspace := filepath.Join(root, "workspace")
+	if err := os.Mkdir(workspace, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := isInTempDir(tt.path); got != tt.want {
-				t.Errorf("isInTempDir(%q) = %v, want %v", tt.path, got, tt.want)
+	inside := filepath.Join(workspace, "report.pdf")
+	outside := filepath.Join(root, "secret.txt")
+	for _, path := range []string{inside, outside} {
+		if err := os.WriteFile(path, []byte("test"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(workspace, "linked.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		path      string
+		wantMedia bool
+	}{
+		{"relative workspace file", "report.pdf", true},
+		{"absolute workspace file", inside, true},
+		{"absolute temp sibling", outside, false},
+		{"relative traversal", "../secret.txt", false},
+		{"absolute traversal", workspace + "/../secret.txt", false},
+		{"symlink escape", link, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msgBus := bus.New()
+			tool := NewMessageTool("", true)
+			tool.SetMessageBus(msgBus)
+			ctx := WithToolWorkspace(context.Background(), workspace)
+			message := "MEDIA:" + tc.path
+			result := tool.Execute(ctx, map[string]any{
+				"action": "send", "channel": "telegram", "target": "chat", "message": message,
+			})
+			if result.IsError {
+				t.Fatalf("Execute: %s", result.ForLLM)
+			}
+			ctx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			out, ok := msgBus.SubscribeOutbound(ctx)
+			if !ok {
+				t.Fatal("missing outbound message")
+			}
+			if tc.wantMedia {
+				if len(out.Media) != 1 || out.Media[0].URL != inside {
+					t.Fatalf("workspace attachment = %+v, want %q", out.Media, inside)
+				}
+			} else if len(out.Media) != 0 || out.Content != message {
+				t.Fatalf("escaped path published as attachment: %+v", out)
+			}
+		})
+	}
+}
+
+func TestTtsMediaWorkspaceBoundary(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/audio/speech" {
+			http.NotFound(w, r)
+			return
+		}
+		if _, err := w.Write([]byte("audio")); err != nil {
+			t.Error(err)
+		}
+	}))
+	defer server.Close()
+	manager := tts.NewManager(tts.ManagerConfig{})
+	manager.RegisterProvider(tts.NewOpenAIProvider(tts.OpenAIConfig{APIBase: server.URL}))
+	for _, restricted := range []bool{true, false} {
+		t.Run(fmt.Sprintf("restricted=%v", restricted), func(t *testing.T) {
+			ctx := context.Background()
+			if restricted {
+				ctx = WithToolWorkspace(ctx, t.TempDir())
+			}
+			result := NewTtsTool(manager).Execute(ctx, map[string]any{"text": "hello"})
+			if result.IsError {
+				t.Fatal(result.ForLLM)
+			}
+			tool := NewMessageTool("", restricted)
+			msgBus := bus.New()
+			tool.SetMessageBus(msgBus)
+			sent := tool.Execute(ctx, map[string]any{
+				"action": "send", "channel": "telegram", "target": "chat", "message": result.ForLLM,
+			})
+			if sent.IsError {
+				t.Fatal(sent.ForLLM)
+			}
+			ctx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			out, ok := msgBus.SubscribeOutbound(ctx)
+			if !ok || len(out.Media) != 1 {
+				t.Fatalf("generated TTS media not attached: %+v", out)
+			}
+			path := out.Media[0].URL
+			if !restricted {
+				t.Cleanup(func() {
+					if err := os.Remove(path); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			if audio, err := os.ReadFile(path); err != nil || string(audio) != "audio" {
+				t.Fatalf("generated audio = %q, err = %v", audio, err)
 			}
 		})
 	}

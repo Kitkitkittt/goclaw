@@ -77,6 +77,8 @@ flowchart TD
 
 **Path traversal**: `resolvePath()` applies `filepath.Clean()` then `HasPrefix()` to ensure all paths stay within the workspace. With `restrict = true`, any path outside the workspace is blocked.
 
+The `message` tool applies the same canonical workspace boundary to `MEDIA:` attachments, including symlink and hardlink checks. Temporary files outside the workspace are not exempt when restriction is enabled. Generated TTS audio is written into the context workspace when available; without a workspace it retains temporary output for unrestricted callers.
+
 **PathDenyable** -- An interface that lets filesystem tools reject specific path prefixes:
 
 ```go
